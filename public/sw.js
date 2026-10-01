@@ -1,7 +1,7 @@
 const CACHE_NAME = 'yupos-shell-v11';
 
 function appUrl(path) { return new URL(path, self.registration.scope).toString(); }
-const APP_SHELL = [appUrl('./'),appUrl('./index.html'),appUrl('./manifest.webmanifest'),appUrl('./assets/icon-192.png'),appUrl('./assets/icon-512.png'),appUrl('./assets/yupos-app-icon.png')];
+const APP_SHELL = [appUrl('./'),appUrl('./index.html'),appUrl('./manifest.webmanifest')];
 
 self.addEventListener('install',(event)=>{event.waitUntil(caches.open(CACHE_NAME).then((cache)=>cache.addAll(APP_SHELL)).then(()=>self.skipWaiting()));});
 self.addEventListener('activate',(event)=>{event.waitUntil(caches.keys().then((keys)=>Promise.all(keys.filter((key)=>key!==CACHE_NAME).map((key)=>caches.delete(key)))).then(()=>self.clients.claim()));});
