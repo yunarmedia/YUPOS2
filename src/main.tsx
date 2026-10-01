@@ -125,31 +125,44 @@ function installYuposConfirmBridge() {
 }
 installYuposConfirmBridge();
 
-async function bootstrapYupos() {
+function bootstrapYupos() {
   const rootElement = document.getElementById('root');
   if (!rootElement) throw new Error('YUPOS root element (#root) was not found.');
 
-  let unsubscribe: (() => void) | null = null;
-  try {
-    await new Promise<void>((resolve) => {
-      let settled = false;
-      unsubscribe = onAuthStateChanged(auth, async (user) => {
-        if (settled) return;
-        settled = true;
-        if (user?.uid) await hydrateMerchantDataFromFirebase(user.uid);
-        resolve();
-      });
-    });
-  } catch (error) {
-    console.warn('YUPOS cloud bootstrap warning:', error);
-  } finally {
-    unsubscribe?.();
-  }
-
+  // Render React immediately. Cloud hydration must never block the UI on slow/old Android browsers.
   createRoot(rootElement).render(<StrictMode><AuthBootstrap><UpdateNotice /><App /></AuthBootstrap></StrictMode>);
+
+  // Firebase reconciliation runs in the background after the first paint.
+  void new Promise<void>((resolve) => {
+    let unsubscribe: (() => void) | null = null;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      unsubscribe?.();
+      resolve();
+    };
+
+    try {
+      unsubscribe = onAuthStateChanged(auth, async (user) => {
+        try {
+          if (user?.uid) await hydrateMerchantDataFromFirebase(user.uid);
+        } catch (error) {
+          console.warn('YUPOS cloud bootstrap warning:', error);
+        } finally {
+          finish();
+        }
+      });
+    } catch (error) {
+      console.warn('YUPOS auth bootstrap warning:', error);
+      finish();
+    }
+
+    window.setTimeout(finish, 8000);
+  });
 }
 
-void bootstrapYupos();
+bootstrapYupos();
 
 if ('serviceWorker' in navigator && import.meta.env.PROD) {
   window.addEventListener('load', () => {
