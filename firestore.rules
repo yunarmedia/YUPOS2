@@ -1,0 +1,64 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // The authenticated Firebase UID is the tenant boundary for all merchant data.
+    function isMerchant(merchantId) {
+      return request.auth != null && request.auth.uid == merchantId;
+    }
+
+    function merchantFieldMatches(merchantId) {
+      return !('merchantId' in request.resource.data) || request.resource.data.merchantId == merchantId;
+    }
+
+    match /admins/{adminId} {
+      allow read: if request.auth != null
+        && request.auth.uid == adminId
+        && resource.data.role == 'developer'
+        && resource.data.active == true;
+      allow write: if false;
+    }
+
+    match /merchants/{merchantId} {
+      allow read: if isMerchant(merchantId);
+      allow create, update: if isMerchant(merchantId)
+        && request.resource.data.uid == merchantId;
+      allow delete: if false;
+    }
+
+    match /yupos_config/{merchantId}/settings/{document} {
+      allow read: if isMerchant(merchantId);
+      allow create, update: if isMerchant(merchantId) && merchantFieldMatches(merchantId);
+      allow delete: if isMerchant(merchantId);
+    }
+
+    match /yupos_catalog/{merchantId}/{businessType}/{document} {
+      allow read: if isMerchant(merchantId);
+      allow create, update: if isMerchant(merchantId) && merchantFieldMatches(merchantId);
+      allow delete: if isMerchant(merchantId);
+    }
+
+    match /yupos_transactions/{merchantId}/{businessType}/{document} {
+      allow read: if isMerchant(merchantId);
+      allow create, update: if isMerchant(merchantId) && merchantFieldMatches(merchantId);
+      allow delete: if isMerchant(merchantId);
+    }
+
+    match /yupos_finances/{merchantId}/{businessType}/{document} {
+      allow read: if isMerchant(merchantId);
+      allow create, update: if isMerchant(merchantId) && merchantFieldMatches(merchantId);
+      allow delete: if isMerchant(merchantId);
+    }
+
+    match /yupos_crm/{merchantId}/customers/{document} {
+      allow read: if isMerchant(merchantId);
+      allow create, update: if isMerchant(merchantId) && merchantFieldMatches(merchantId);
+      allow delete: if isMerchant(merchantId);
+    }
+
+    // Deny every document path not explicitly owned by the authenticated UID.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

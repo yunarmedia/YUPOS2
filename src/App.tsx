@@ -1,0 +1,1187 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { onAuthStateChanged, signOut } from 'firebase/auth';
+import { auth } from './config/firebase';
+import { 
+  BusinessType, 
+  ItemType, 
+  ProductItem, 
+  CartItem, 
+  Order, 
+  Expense, 
+  StoreSettings, 
+  MerchantUser, 
+  PortalPins,
+  Customer
+} from './types';
+import { BUSINESS_PRESETS } from './config/businessCategories';
+import { 
+  defaultSettings,
+  loadMerchantSettings,
+  saveMerchantSettings,
+  loadMerchantProducts,
+  saveMerchantProducts,
+  loadMerchantOrders,
+  saveMerchantOrders,
+  loadMerchantExpenses,
+  saveMerchantExpenses,
+  loadMerchantPettyCash,
+  saveMerchantPettyCash,
+  syncConfigToFirebase, 
+  syncProductsToFirebase, 
+  syncOrdersToFirebase, 
+  syncExpensesToFirebase, 
+  syncPettyCashToFirebase 
+} from './services/storageService';
+import {
+  loadCustomers,
+  saveCustomers,
+  hydrateCustomersFromFirebase,
+  syncCustomersToFirebase,
+  recordCustomerVisit
+} from './services/customerService';
+import { hydrateMerchantDataFromFirebase as hydrateMerchantCloudData } from './services/merchantCloudHydration';
+
+import { MerchantLogin } from './components/MerchantLogin';
+import { Sidebar } from './components/Sidebar';
+import { PosView } from './components/PosView';
+import { CustomerView } from './components/CustomerView';
+import { RevenueView } from './components/RevenueView';
+import { ExpensesView } from './components/ExpensesView';
+import { InventoryView } from './components/InventoryView';
+import { HistoryView } from './components/HistoryView';
+import { StaffView } from './components/StaffView';
+import { SettingsView } from './components/SettingsView';
+import { PrinterView } from './components/PrinterView';
+import { ExtractDataView } from './components/ExtractDataView';
+import { 
+  requestBluetoothPrinter, 
+  sendBluetoothData, 
+  buildReceiptEscPos 
+} from './services/printerService';
+import { AdminModal } from './components/AdminModal';
+import { PrintReceipt } from './components/PrintReceipt';
+import { Toast, ToastMessage } from './components/Toast';
+import { Menu, Lock, Eye, EyeOff } from 'lucide-react';
+import { AppSplash } from './components/AppSplash';
+import { playPaymentSound, speakPayment } from './services/audioService';
+
+// Time range checker for customizable shift hours
+function isTimeWithinRange(currentTimeStr: string, startStr: string, endStr: string): boolean {
+  if (!startStr || !endStr) return false;
+  const [curH, curM] = currentTimeStr.split(':').map(Number);
+  const [startH, startM] = startStr.split(':').map(Number);
+  const [endH, endM] = endStr.split(':').map(Number);
+
+  const curMinutes = curH * 60 + curM;
+  const startMinutes = startH * 60 + startM;
+  const endMinutes = endH * 60 + endM;
+
+  if (startMinutes <= endMinutes) {
+    return curMinutes >= startMinutes && curMinutes < endMinutes;
+  } else {
+    // Overnight shift (e.g. 22:00 - 06:00)
+    return curMinutes >= startMinutes || curMinutes < endMinutes;
+  }
+}
+
+export default function App() {
+  // Authentication State — Firebase Auth is the sole source of merchant identity.
+  // localStorage is never trusted to establish or restore the active merchant.
+  const [merchant, setMerchant] = useState<MerchantUser | null>(null);
+  const [splashVisible, setSplashVisible] = useState(true);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setSplashVisible(false), 1800);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  // Active view tab
+  const [activeTab, setActiveTab] = useState<string>('pos');
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  const merchantId = merchant?.uid || '';
+
+  // Core POS states with strict merchant and businessType isolation
+  const [settings, setSettings] = useState<StoreSettings>(() => {
+    return loadMerchantSettings(merchantId);
+  });
+
+  const [products, setProducts] = useState<ProductItem[]>(() => {
+    return loadMerchantProducts(merchantId, settings.businessType);
+  });
+
+  const [orders, setOrders] = useState<Order[]>(() => {
+    return loadMerchantOrders(merchantId, settings.businessType);
+  });
+
+  const [expenses, setExpenses] = useState<Expense[]>(() => {
+    return loadMerchantExpenses(merchantId, settings.businessType);
+  });
+
+  const [pettyCash, setPettyCash] = useState<number>(() => {
+    return loadMerchantPettyCash(merchantId, settings.businessType);
+  });
+
+  const [customers, setCustomers] = useState<Customer[]>(() => {
+    return loadCustomers(merchantId);
+  });
+
+  // Cart & Transaction states
+  const [cart, setCart] = useState<CartItem[]>([]);
+  const [editingOrder, setEditingOrder] = useState<Order | null>(null);
+  const [receiptOrder, setReceiptOrder] = useState<Order | null>(null);
+
+  // Bluetooth printer states
+  const [btStatusKasir, setBtStatusKasir] = useState<string>('🔴 Belum Terkoneksi');
+  const [btStatusDapur, setBtStatusDapur] = useState<string>('🔴 Belum Terkoneksi');
+  const printerKasirCharRef = useRef<any>(null);
+  const printerKasirDeviceRef = useRef<any>(null);
+  const printerDapurCharRef = useRef<any>(null);
+  const printerDapurDeviceRef = useRef<any>(null);
+
+  // Toast notifications
+  const [toasts, setToasts] = useState<ToastMessage[]>([]);
+
+  // Tab PIN Authentication Modal (in-app modal replacing window.prompt)
+  const [tabAuthModal, setTabAuthModal] = useState<{
+    targetTab: string;
+    title: string;
+    expectedPin: string;
+  } | null>(null);
+  const [enteredTabPin, setEnteredTabPin] = useState('');
+  const [tabPinError, setTabPinError] = useState<string | null>(null);
+  const [showTabPin, setShowTabPin] = useState(false);
+
+  const showToast = (message: string, type: 'success' | 'error' | 'info' | 'warning' = 'success') => {
+    const id = Date.now().toString() + Math.random().toString(36).substring(2, 5);
+    setToasts((prev) => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 4000);
+  };
+
+  const dismissToast = (id: string) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  };
+
+  // Every mutating operation must have an authenticated Firebase UID.
+  // Empty / fallback merchant IDs are never valid.
+  const requireMerchantId = (): string | null => {
+    const uid = merchant?.uid?.trim();
+    if (uid) return uid;
+
+    showToast('Sesi merchant tidak valid. Silakan login kembali.', 'error');
+    return null;
+  };
+
+  // Play audio buzzer on key events
+  const playBuzzer = () => {
+    try {
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gainNode = ctx.createGain();
+      osc.connect(gainNode);
+      gainNode.connect(ctx.destination);
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(800, ctx.currentTime);
+      gainNode.gain.setValueAtTime(0.08, ctx.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.15);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.15);
+    } catch (e) {
+      // Audio context might be restricted before user gesture
+    }
+  };
+
+  // Reload isolated merchant data whenever the authenticated UID changes.
+  // localStorage is the fast cache; the shared cloud hydrator owns Firestore -> cache
+  // reconciliation so a missing/empty cloud snapshot can never wipe an existing cache.
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!merchant?.uid) return;
+
+    const currentMId = merchant.uid;
+    const loadedSettings = loadMerchantSettings(currentMId);
+
+    // Fast path: show the merchant-scoped local cache immediately.
+    setSettings(loadedSettings);
+    setProducts(loadMerchantProducts(currentMId, loadedSettings.businessType));
+    setOrders(loadMerchantOrders(currentMId, loadedSettings.businessType));
+    setExpenses(loadMerchantExpenses(currentMId, loadedSettings.businessType));
+    setPettyCash(loadMerchantPettyCash(currentMId, loadedSettings.businessType));
+    setCustomers(loadCustomers(currentMId));
+    setCart([]);
+    setEditingOrder(null);
+
+    // Reconcile with Firestore using the shared safe hydrator. It preserves an
+    // existing local dataset when cloud snapshots are missing or empty.
+    void (async () => {
+      await hydrateMerchantCloudData(currentMId);
+      if (cancelled) return;
+
+      const hydratedSettings = loadMerchantSettings(currentMId);
+      setSettings(hydratedSettings);
+      setProducts(loadMerchantProducts(currentMId, hydratedSettings.businessType));
+      setOrders(loadMerchantOrders(currentMId, hydratedSettings.businessType));
+      setExpenses(loadMerchantExpenses(currentMId, hydratedSettings.businessType));
+      setPettyCash(loadMerchantPettyCash(currentMId, hydratedSettings.businessType));
+      setCustomers(loadCustomers(currentMId));
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [merchant?.uid]);
+
+  // Firebase Auth is authoritative. Do not restore merchant identity from localStorage.
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (!user) {
+        setMerchant(null);
+        return;
+      }
+
+      setMerchant({
+        uid: user.uid,
+        email: user.email,
+        displayName: user.displayName || user.email?.split('@')[0] || 'Merchant',
+      });
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // Customizable Auto-shift scheduler (consumes custom hours shift1Start/End & shift2Start/End)
+  const autoShiftSyncRef = useRef(false);
+
+  useEffect(() => {
+    const checkShift = async () => {
+      if (settings.manualOverride || autoShiftSyncRef.current) return;
+
+      const mId = merchant?.uid?.trim();
+      if (!mId) return;
+
+      // Always start from the latest persisted merchant snapshot. The React
+      // closure can be stale and must never be allowed to overwrite profile,
+      // categories, staff, or other settings during an automatic shift change.
+      const latestSettings = loadMerchantSettings(mId);
+      const now = new Date();
+      const curTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+      const s1Start = latestSettings.shift1Start || '10:00';
+      const s1End = latestSettings.shift1End || '13:00';
+
+      const inShift1 = isTimeWithinRange(curTime, s1Start, s1End);
+      const expectedShift: '1' | '2' = inShift1 ? '1' : '2';
+
+      if (latestSettings.activeShift !== expectedShift) {
+        const updated = { ...latestSettings, activeShift: expectedShift };
+        autoShiftSyncRef.current = true;
+        try {
+          const persisted = await syncConfigToFirebase(updated, mId);
+          if (!persisted) {
+            showToast('Gagal menyimpan perubahan shift ke cloud.', 'error');
+            return;
+          }
+          setSettings(updated);
+        } finally {
+          autoShiftSyncRef.current = false;
+        }
+      }
+    };
+
+    checkShift();
+    const interval = setInterval(checkShift, 30000);
+    return () => clearInterval(interval);
+  }, [
+    settings.manualOverride,
+    merchant?.uid
+  ]);
+
+  // Handle Tab Navigation with PIN protection
+  const handleSelectTab = (tabId: string) => {
+    const openProtectedTab = (targetTab: string, title: string, configuredPin?: string) => {
+      const pin = String(configuredPin || '').trim();
+      if (!pin) {
+        setActiveTab(targetTab);
+        return;
+      }
+
+      setTabAuthModal({
+        targetTab,
+        title,
+        expectedPin: pin,
+      });
+      setEnteredTabPin('');
+      setTabPinError(null);
+    };
+
+    if (tabId === 'admin') {
+      openProtectedTab('admin', 'Otoritas Admin Kontrol', settings.portalPins?.admin);
+      return;
+    }
+
+    if (tabId === 'expenses') {
+      openProtectedTab('expenses', 'Sandi Portal Pengeluaran', settings.portalPins?.expenses);
+      return;
+    }
+
+    if (tabId === 'inventory') {
+      openProtectedTab('inventory', 'Sandi Portal Produk & Jasa', settings.portalPins?.inventory);
+      return;
+    }
+
+    if (tabId === 'staff') {
+      openProtectedTab('staff', 'Sandi Portal Karyawan & Shift', settings.portalPins?.staff);
+      return;
+    }
+
+    if (tabId === 'settings') {
+      openProtectedTab('settings', 'Sandi Portal Pengaturan Sistem', settings.portalPins?.settings);
+      return;
+    }
+
+    setActiveTab(tabId);
+  };
+
+  const handleVerifyTabPin = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!tabAuthModal) return;
+
+    if (enteredTabPin === tabAuthModal.expectedPin) {
+      setActiveTab(tabAuthModal.targetTab);
+      setTabAuthModal(null);
+      showToast(`Akses ${tabAuthModal.title} dibuka!`, 'success');
+    } else {
+      setTabPinError('Sandi / Kode Otoritas Salah! Periksa kembali.');
+    }
+  };
+
+  // Logout handler - manual logout only
+  const handleLogout = async () => {
+    setMerchant(null);
+    try {
+      await signOut(auth);
+    } catch (e) {
+      console.warn('Logout error:', e);
+    }
+    showToast('Berhasil keluar dari akun kasir.', 'info');
+  };
+
+  // Bluetooth printer connectivity
+  const connectBluetoothPrinter = async (type: 'kasir' | 'dapur') => {
+    try {
+      showToast('Membuka dialog pencarian printer Bluetooth...', 'info');
+      const conn = await requestBluetoothPrinter();
+
+      // Listen for unexpected device disconnects
+      conn.device.addEventListener('gattserverdisconnected', () => {
+        if (type === 'kasir') {
+          setBtStatusKasir('🔴 Terputus');
+          printerKasirCharRef.current = null;
+          printerKasirDeviceRef.current = null;
+        } else {
+          setBtStatusDapur('🔴 Terputus');
+          printerDapurCharRef.current = null;
+          printerDapurDeviceRef.current = null;
+        }
+        showToast(`Printer Bluetooth ${type === 'kasir' ? 'Kasir' : 'Dapur'} terputus.`, 'warning');
+      });
+
+      if (type === 'kasir') {
+        printerKasirCharRef.current = conn.characteristic;
+        printerKasirDeviceRef.current = conn.device;
+        setBtStatusKasir(`🟢 Terkoneksi: ${conn.device.name || 'Printer Kasir'}`);
+      } else {
+        printerDapurCharRef.current = conn.characteristic;
+        printerDapurDeviceRef.current = conn.device;
+        setBtStatusDapur(`🟢 Terkoneksi: ${conn.device.name || 'Printer Dapur'}`);
+      }
+
+      showToast(`Printer Bluetooth ${type === 'kasir' ? 'Kasir' : 'Dapur'} (${conn.device.name || 'BT Printer'}) berhasil terhubung!`, 'success');
+    } catch (err: any) {
+      console.warn('BT Connect error:', err);
+      const msg = err?.message || '';
+      if (msg.includes('User cancelled')) {
+        showToast('Pencarian printer Bluetooth dibatalkan pengguna.', 'info');
+      } else {
+        showToast(`Gagal menghubungkan printer: ${msg || 'Periksa koneksi Bluetooth'}`, 'error');
+      }
+    }
+  };
+
+  const disconnectBluetoothPrinter = async (type: 'kasir' | 'dapur') => {
+    try {
+      if (type === 'kasir' && printerKasirDeviceRef.current?.gatt?.connected) {
+        printerKasirDeviceRef.current.gatt.disconnect();
+        printerKasirCharRef.current = null;
+        printerKasirDeviceRef.current = null;
+        setBtStatusKasir('🔴 Belum Terkoneksi');
+        showToast('Printer Kasir berhasil diputus.', 'info');
+      } else if (type === 'dapur' && printerDapurDeviceRef.current?.gatt?.connected) {
+        printerDapurDeviceRef.current.gatt.disconnect();
+        printerDapurCharRef.current = null;
+        printerDapurDeviceRef.current = null;
+        setBtStatusDapur('🔴 Belum Terkoneksi');
+        showToast('Printer Dapur berhasil diputus.', 'info');
+      }
+    } catch (e) {
+      console.warn('Disconnect error:', e);
+    }
+  };
+
+  // Execute print receipt
+  const executePrintReceipt = async (orderToPrint: Order) => {
+    setReceiptOrder(orderToPrint);
+
+    // If bluetooth printer is connected, send ESC/POS binary data
+    if (printerKasirCharRef.current) {
+      try {
+        const rawBytes = buildReceiptEscPos(orderToPrint, settings);
+        await sendBluetoothData(printerKasirCharRef.current, rawBytes);
+        showToast('Struk berhasil dicetak via Bluetooth ESC/POS!', 'success');
+        return;
+      } catch (err: any) {
+        console.warn('Bluetooth print failed, falling back to window.print:', err);
+        showToast('Gagal cetak Bluetooth, membuka dialog cetak browser...', 'warning');
+      }
+    }
+
+    // Fallback standard browser print
+    setTimeout(() => {
+      window.print();
+    }, 150);
+  };
+
+  // Save or complete an order
+  const handleSaveOrder = async (
+    status: 'selesai' | 'pending',
+    paymentMethod: string,
+    customerNote: string,
+    discount: number,
+    discountType: 'Rp' | '%',
+    discountValue: number,
+    customerDetails?: {
+      name: string;
+      phone: string;
+      customerCode: string;
+      isMember: boolean;
+      registerAsMember?: boolean;
+    }
+  ) => {
+    const currentMId = requireMerchantId();
+    if (!currentMId) return;
+
+    const subtotal = cart.reduce((s, i) => s + i.price * i.qty, 0);
+    const afterDiscount = Math.max(0, subtotal - discount);
+    const ppnRate = settings.ppnEnabled ? (settings.ppnRate ?? 0) : 0;
+    const ppn = ppnRate > 0 ? Math.round(afterDiscount * (ppnRate / 100)) : 0;
+    const finalTotal = afterDiscount + ppn;
+
+    const now = new Date();
+    const todayDate = now.toISOString().split('T')[0];
+    const timeStr = now.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+    const cashierName = settings.activeShift === '1' ? settings.shift1Name : settings.shift2Name;
+
+    const currentBType = settings.businessType;
+
+    let savedOrder: Order;
+
+    if (editingOrder) {
+      savedOrder = {
+        ...editingOrder,
+        customer: customerNote || editingOrder.customer || 'Pelanggan',
+        customerPhone: customerDetails?.phone || editingOrder.customerPhone,
+        customerCode: customerDetails?.customerCode || editingOrder.customerCode,
+        customerIsMember: customerDetails?.isMember ?? editingOrder.customerIsMember,
+        items: [...cart],
+        subtotal,
+        discount,
+        discountType,
+        discountValue,
+        ppn,
+        ppnRate,
+        total: finalTotal,
+        status,
+        payment: paymentMethod,
+      };
+
+      const updated = orders.map((o) => (o.id === editingOrder.id ? savedOrder : o));
+      const persisted = await syncOrdersToFirebase(updated, currentMId, currentBType);
+    if (!persisted) { showToast('Gagal menyimpan transaksi ke cloud. Transaksi tidak diselesaikan.', 'error'); return; }
+    setOrders(updated);
+    } else {
+      const newId = 'ORD-' + Date.now().toString(36).toUpperCase();
+      savedOrder = {
+        id: newId,
+        date: todayDate,
+        time: timeStr,
+        timestamp: Date.now(),
+        customer: customerNote || 'Pelanggan',
+        customerPhone: customerDetails?.phone,
+        customerCode: customerDetails?.customerCode,
+        customerIsMember: customerDetails?.isMember,
+        items: [...cart],
+        subtotal,
+        discount,
+        discountType,
+        discountValue,
+        ppn,
+        ppnRate,
+        total: finalTotal,
+        status,
+        payment: paymentMethod,
+        shift: settings.activeShift,
+        cashierName: cashierName || 'Kasir',
+        businessType: currentBType,
+        merchantId: currentMId,
+      };
+
+      const updated = [...orders, savedOrder];
+      const persisted = await syncOrdersToFirebase(updated, currentMId, currentBType);
+    if (!persisted) { showToast('Gagal menyimpan transaksi ke cloud. Transaksi tidak diselesaikan.', 'error'); return; }
+    setOrders(updated);
+    }
+
+    // Record customer visit & persist to database
+    if (customerDetails && customerDetails.name && customerDetails.phone) {
+      const updatedCustomers = await recordCustomerVisit(
+        customers,
+        {
+          name: customerDetails.name,
+          phone: customerDetails.phone,
+          customerCode: customerDetails.customerCode,
+          isMember: customerDetails.isMember,
+        },
+        status === 'selesai' ? finalTotal : 0,
+        currentMId
+      );
+      if (updatedCustomers) {
+        setCustomers(updatedCustomers);
+      } else {
+        showToast('Transaksi tersimpan, tetapi riwayat customer gagal disimpan ke cloud.', 'warning');
+      }
+    }
+
+    // Reset cashier cart
+    setCart([]);
+    setEditingOrder(null);
+
+    playBuzzer();
+    if (status === 'selesai') {
+      void playPaymentSound();
+      speakPayment(finalTotal, paymentMethod);
+      showToast(`Transaksi ${paymentMethod} sebesar ${new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 }).format(finalTotal)} berhasil diselesaikan!`, 'success');
+      if (settings.btAutoPrint) {
+        executePrintReceipt(savedOrder);
+      }
+    } else {
+      showToast('Pesanan berhasil digantung / masuk antrian.', 'info');
+    }
+  };
+
+  // Print temporary cart bill
+  const handlePrintCart = (customerNote: string, discount: number) => {
+    if (!requireMerchantId()) return;
+    if (cart.length === 0) return;
+
+    const subtotal = cart.reduce((s, i) => s + i.price * i.qty, 0);
+    const afterDiscount = Math.max(0, subtotal - discount);
+    const ppnRate = settings.ppnEnabled ? (settings.ppnRate ?? 0) : 0;
+    const ppn = ppnRate > 0 ? Math.round(afterDiscount * (ppnRate / 100)) : 0;
+    const finalTotal = afterDiscount + ppn;
+
+    const tempOrder: Order = {
+      id: 'BILL-' + Date.now().toString().slice(-4),
+      date: new Date().toISOString().split('T')[0],
+      time: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
+      timestamp: Date.now(),
+      customer: customerNote || 'Pelanggan (Bill)',
+      items: [...cart],
+      subtotal,
+      discount,
+      discountType: 'Rp',
+      discountValue: discount,
+      ppn,
+      ppnRate,
+      total: finalTotal,
+      status: 'pending',
+      payment: 'Belum Bayar',
+      shift: settings.activeShift,
+      cashierName: settings.activeShift === '1' ? settings.shift1Name : settings.shift2Name,
+      businessType: settings.businessType,
+      merchantId: merchant?.uid || undefined,
+    };
+    executePrintReceipt(tempOrder);
+  };
+
+  // Update store settings & switch business models
+  const handleUpdateSettings = async (newSettings: Partial<StoreSettings>): Promise<boolean> => {
+    const currentMId = requireMerchantId();
+    if (!currentMId) return false;
+
+    // Read the latest merchant cache instead of a possibly stale React closure.
+    // This prevents rapid settings/category/staff edits from overwriting each other.
+    const previous = loadMerchantSettings(currentMId);
+    const updated = { ...previous, ...newSettings };
+    const persisted = await syncConfigToFirebase(updated, currentMId);
+    if (!persisted) {
+      showToast('Gagal menyimpan pengaturan ke cloud. Perubahan tidak diterapkan.', 'error');
+      return false;
+    }
+
+    setSettings(updated);
+
+    if (newSettings.businessType && newSettings.businessType !== previous.businessType) {
+      const newType = newSettings.businessType;
+      setProducts(loadMerchantProducts(currentMId, newType));
+      setOrders(loadMerchantOrders(currentMId, newType));
+      setExpenses(loadMerchantExpenses(currentMId, newType));
+      setPettyCash(loadMerchantPettyCash(currentMId, newType));
+      setCart([]);
+      setEditingOrder(null);
+    }
+
+    showToast('Pengaturan berhasil disimpan.', 'success');
+    return true;
+  };
+
+  // Bulk catalog persistence for Excel import. Uses the same merchant/businessType
+  // isolation and sync queue as normal product CRUD.
+  const handleSaveCatalog = async (catalogProducts: ProductItem[], categories: string[]): Promise<boolean> => {
+    const currentMId = requireMerchantId();
+    if (!currentMId) return false;
+    const currentBType = settings.businessType;
+    const normalized = catalogProducts
+      .filter((product) => product && !product.deleted)
+      .map((product) => ({
+        ...product,
+        id: String(product.id || '').trim() || ('PRD-' + Date.now().toString(36).toUpperCase()),
+        name: String(product.name || '').trim(),
+        category: String(product.category || 'Umum').trim() || 'Umum',
+        price: Math.max(0, Number(product.price) || 0),
+        type: product.type === 'service' ? 'service' : 'product',
+        reqStaffRole: String(product.reqStaffRole || 'Kasir').trim() || 'Kasir',
+        available: Boolean(product.available),
+        merchantId: currentMId,
+        businessType: currentBType,
+      } satisfies ProductItem));
+
+    if (!normalized.length) {
+      showToast('Tidak ada produk valid untuk disimpan.', 'error');
+      return false;
+    }
+
+    const nextSettings = {
+      ...loadMerchantSettings(currentMId),
+      categories: Array.from(new Set(categories.map((category) => String(category).trim()).filter(Boolean))),
+    };
+
+    const productsPersisted = await syncProductsToFirebase(normalized, currentMId, currentBType);
+    if (!productsPersisted) {
+      showToast('Gagal menyimpan katalog Excel ke cloud. Data katalog tidak diubah.', 'error');
+      return false;
+    }
+
+    const settingsPersisted = await syncConfigToFirebase(nextSettings, currentMId);
+    if (!settingsPersisted) {
+      showToast('Katalog tersimpan, tetapi sinkronisasi kategori gagal.', 'warning');
+    }
+
+    setProducts(normalized);
+    setSettings(nextSettings);
+    return true;
+  };
+
+  // Product CRUD strictly scoped to active merchant & businessType
+  const handleSaveProduct = async (prodData: Omit<ProductItem, 'id'>, id?: string) => {
+    const currentMId = requireMerchantId();
+    if (!currentMId) return;
+    const currentBType = settings.businessType;
+
+    if (id) {
+      const updated = products.map((p) => (p.id === id ? { ...prodData, id, businessType: currentBType, merchantId: currentMId } : p));
+      const persisted = await syncProductsToFirebase(updated, currentMId, currentBType);
+    if (!persisted) { showToast('Gagal menyimpan katalog ke cloud. Data lokal tidak diubah.', 'error'); return; }
+    setProducts(updated);
+    showToast('Katalog berhasil diperbarui!', 'success');
+    } else {
+      const newProduct: ProductItem = {
+        ...prodData,
+        id: 'PRD-' + Date.now().toString(36).toUpperCase(),
+        businessType: currentBType,
+        merchantId: currentMId,
+      };
+      const updated = [...products, newProduct];
+      const persisted = await syncProductsToFirebase(updated, currentMId, currentBType);
+    if (!persisted) { showToast('Gagal menyimpan katalog ke cloud. Data lokal tidak diubah.', 'error'); return; }
+    setProducts(updated);
+    showToast('Katalog baru berhasil ditambahkan!', 'success');
+    }
+  };
+
+  const handleDeleteProduct = async (id: string) => {
+    const currentMId = requireMerchantId();
+    if (!currentMId) return;
+    const currentBType = settings.businessType;
+    const updated = products.map((p) => (p.id === id ? { ...p, deleted: true } : p));
+    const persisted = await syncProductsToFirebase(updated, currentMId, currentBType);
+    if (!persisted) { showToast('Gagal menyimpan katalog ke cloud. Data lokal tidak diubah.', 'error'); return; }
+    setProducts(updated);
+    showToast('Katalog berhasil dinonaktifkan.', 'info');
+  };
+
+  // Expense CRUD
+  const handleAddExpense = async (expData: Omit<Expense, 'id'>) => {
+    const currentMId = requireMerchantId();
+    if (!currentMId) return;
+    const currentBType = settings.businessType;
+
+    const newExp: Expense = {
+      ...expData,
+      id: 'EXP-' + Date.now().toString(36).toUpperCase(),
+      businessType: currentBType,
+      merchantId: currentMId,
+    };
+    const updated = [...expenses, newExp];
+    const persisted = await syncExpensesToFirebase(updated, currentMId, currentBType);
+    if (!persisted) { showToast('Gagal menyimpan perubahan pengeluaran ke cloud.', 'error'); return; }
+    setExpenses(updated);
+    showToast('Catatan pengeluaran berhasil disimpan.', 'success');
+  };
+
+  const handleUpdateExpense = async (exp: Expense) => {
+    const currentMId = requireMerchantId();
+    if (!currentMId) return;
+    const currentBType = settings.businessType;
+
+    const updated = expenses.map((e) => (String(e.id) === String(exp.id) ? exp : e));
+    const persisted = await syncExpensesToFirebase(updated, currentMId, currentBType);
+    if (!persisted) { showToast('Gagal menyimpan perubahan pengeluaran ke cloud.', 'error'); return; }
+    setExpenses(updated);
+    showToast('Catatan pengeluaran diperbarui.', 'success');
+  };
+
+  const handleDeleteExpense = async (id: string | number) => {
+    const currentMId = requireMerchantId();
+    if (!currentMId) return;
+    const currentBType = settings.businessType;
+
+    const updated = expenses.filter((e) => String(e.id) !== String(id));
+    const persisted = await syncExpensesToFirebase(updated, currentMId, currentBType);
+    if (!persisted) { showToast('Gagal menyimpan perubahan pengeluaran ke cloud.', 'error'); return; }
+    setExpenses(updated);
+    showToast('Pengeluaran berhasil dihapus.', 'info');
+  };
+
+  // Petty Cash
+  const handleSavePettyCash = async (amount: number) => {
+    const currentMId = requireMerchantId();
+    if (!currentMId) return;
+    const currentBType = settings.businessType;
+
+    const persisted = await syncPettyCashToFirebase(amount, currentMId, currentBType);
+    if (!persisted) { showToast('Gagal menyimpan modal awal kasir ke cloud.', 'error'); return; }
+    setPettyCash(amount);
+    showToast('Modal awal kasir berhasil diperbarui!', 'success');
+  };
+
+  // Customer Management Handlers
+  const handleSaveCustomer = async (customerData: Omit<Customer, 'id'>, id?: string) => {
+    const currentMId = requireMerchantId();
+    if (!currentMId) return;
+    let updated: Customer[];
+
+    if (id) {
+      updated = customers.map((c) => (c.id === id ? { ...customerData, id } : c));
+      showToast('Data customer berhasil diperbarui!', 'success');
+    } else {
+      const newCustomer: Customer = {
+        ...customerData,
+        id: 'CUST-' + Date.now().toString(36).toUpperCase(),
+        createdAt: Date.now(),
+        visitCount: customerData.visitCount || 0,
+        totalSpent: customerData.totalSpent || 0,
+      };
+      updated = [newCustomer, ...customers];
+      showToast('Customer baru berhasil didaftarkan!', 'success');
+    }
+
+    const persisted = await syncCustomersToFirebase(currentMId, updated);
+    if (!persisted) { showToast('Gagal menyimpan data customer ke cloud.', 'error'); return; }
+    setCustomers(updated);
+    };
+
+  const handleDeleteCustomer = async (id: string) => {
+    const currentMId = requireMerchantId();
+    if (!currentMId) return;
+    const updated = customers.filter((c) => c.id !== id);
+    const persisted = await syncCustomersToFirebase(currentMId, updated);
+    if (!persisted) { showToast('Gagal menyimpan data customer ke cloud.', 'error'); return; }
+    setCustomers(updated);
+    showToast('Data customer berhasil dihapus.', 'info');
+  };
+
+  const handleToggleMembership = async (id: string) => {
+    const currentMId = requireMerchantId();
+    if (!currentMId) return;
+    const updated = customers.map((c) => {
+      if (c.id === id) {
+        const nextState = !c.isMember;
+        return {
+          ...c,
+          isMember: nextState,
+          memberSince: nextState ? (c.memberSince || new Date().toISOString().split('T')[0]) : undefined,
+        };
+      }
+      return c;
+    });
+    const persisted = await syncCustomersToFirebase(currentMId, updated);
+    if (!persisted) { showToast('Gagal menyimpan data customer ke cloud.', 'error'); return; }
+    setCustomers(updated);
+    showToast('Status membership customer diperbarui!', 'success');
+  };
+
+  // History Actions
+  const handleEditPendingOrder = (order: Order) => {
+    setEditingOrder(order);
+    setCart([...order.items]);
+    setActiveTab('pos');
+    showToast(`Memuat pesanan #${order.id} ke keranjang kasir.`, 'info');
+  };
+
+  const handleCancelOrder = async (orderId: string) => {
+    const currentMId = requireMerchantId();
+    if (!currentMId) return;
+    const currentBType = settings.businessType;
+
+    const updated = orders.map((o) => (o.id === orderId ? { ...o, status: 'batal' as const } : o));
+    const persisted = await syncOrdersToFirebase(updated, currentMId, currentBType);
+    if (!persisted) { showToast('Gagal menyimpan transaksi ke cloud. Transaksi tidak diselesaikan.', 'error'); return; }
+    setOrders(updated);
+    showToast('Status pesanan dibatalkan.', 'warning');
+  };
+
+  const handleDeleteOrderPermanently = async (orderId: string) => {
+    const currentMId = requireMerchantId();
+    if (!currentMId) return;
+    const currentBType = settings.businessType;
+
+    const updated = orders.filter((o) => o.id !== orderId);
+    const persisted = await syncOrdersToFirebase(updated, currentMId, currentBType);
+    if (!persisted) { showToast('Gagal menyimpan transaksi ke cloud. Transaksi tidak diselesaikan.', 'error'); return; }
+    setOrders(updated);
+    showToast('Pesanan dihapus secara permanen.', 'info');
+  };
+
+  // App splash screen is shown on every fresh app entry.
+  if (splashVisible) {
+    return <AppSplash />;
+  }
+
+  // If merchant is not logged in, render Merchant Login screen
+  if (!merchant) {
+    return (
+      <div className="w-full h-screen bg-slate-50 flex items-center justify-center p-3 sm:p-4">
+        <MerchantLogin 
+          onLoginSuccess={() => {
+            // Identity is established exclusively by Firebase Auth observer above.
+          }} 
+        />
+        <Toast toasts={toasts} onDismiss={dismissToast} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-[100dvh] w-screen overflow-hidden bg-slate-50 font-sans select-none">
+      {/* Toast Alert System */}
+      <Toast toasts={toasts} onDismiss={dismissToast} />
+
+      {/* Hidden Print Receipt Template */}
+      <PrintReceipt order={receiptOrder} settings={settings} />
+
+      {/* Main Sidebar Navigation with Mobile Responsive Drawer */}
+      <Sidebar
+        activeTab={activeTab}
+        onSelectTab={(tabId) => {
+          handleSelectTab(tabId);
+          setSidebarOpen(false);
+        }}
+        settings={settings}
+        merchant={merchant}
+        onLogout={handleLogout}
+        isOpen={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+      />
+
+      {/* Workspace Area */}
+      <main className="flex-1 flex flex-col min-w-0 min-h-0 h-full overflow-hidden relative bg-slate-50">
+        {/* Mobile Top Header */}
+        <div className="md:hidden flex items-center justify-between px-3.5 py-2.5 bg-blue-950 text-white shrink-0 border-b border-blue-900 shadow-sm z-30">
+          <div className="flex items-center gap-2.5">
+            <button
+              type="button"
+              onClick={() => setSidebarOpen(true)}
+              className="p-1.5 -ml-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-white transition-colors"
+              title="Buka Menu"
+            >
+              <Menu className="w-5 h-5" />
+            </button>
+            <div className="leading-tight">
+              <span className="text-xs font-black tracking-wide text-white block truncate max-w-[150px] sm:max-w-[220px]">
+                {settings.storeName}
+              </span>
+              <span className="text-[10px] text-blue-300 font-bold uppercase">
+                {activeTab} • Shift {settings.activeShift}
+              </span>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => handleSelectTab('printer')}
+              className={`px-2 py-1 rounded-lg text-[11px] font-bold transition-all border ${
+                activeTab === 'printer' 
+                  ? 'bg-blue-600 text-white border-blue-600' 
+                  : 'bg-slate-800 text-slate-200 border-slate-700 hover:bg-slate-700'
+              }`}
+            >
+              🖨️
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSelectTab('pos')}
+              className={`px-2.5 py-1 rounded-lg text-[11px] font-black transition-all ${
+                activeTab === 'pos' 
+                  ? 'bg-blue-600 text-white shadow-xs' 
+                  : 'bg-slate-800 text-slate-200 border border-slate-700 hover:bg-slate-700'
+              }`}
+            >
+              Kasir
+            </button>
+          </div>
+        </div>
+
+        {activeTab === 'pos' && (
+          <PosView
+            products={products}
+            settings={settings}
+            cart={cart}
+            setCart={setCart}
+            editingOrder={editingOrder}
+            customers={customers}
+            onSaveOrder={handleSaveOrder}
+            onPrintCart={handlePrintCart}
+            onCancelEditOrder={() => {
+              setEditingOrder(null);
+              setCart([]);
+              showToast('Batal edit pesanan.', 'info');
+            }}
+            onShowToast={showToast}
+          />
+        )}
+
+        {activeTab === 'customers' && (
+          <CustomerView
+            customers={customers}
+            onSaveCustomer={handleSaveCustomer}
+            onDeleteCustomer={handleDeleteCustomer}
+            onToggleMembership={handleToggleMembership}
+            onShowToast={showToast}
+          />
+        )}
+
+        {activeTab === 'revenue' && (
+          <RevenueView
+            orders={orders}
+            expenses={expenses}
+            pettyCash={pettyCash}
+            onSavePettyCash={handleSavePettyCash}
+            settings={settings}
+            onShowToast={showToast}
+            onNavigateToExtract={() => handleSelectTab('extract')}
+          />
+        )}
+
+        {activeTab === 'extract' && (
+          <ExtractDataView
+            orders={orders}
+            expenses={expenses}
+            settings={settings}
+            onShowToast={showToast}
+          />
+        )}
+
+        {activeTab === 'expenses' && (
+          <ExpensesView
+            expenses={expenses}
+            onAddExpense={handleAddExpense}
+            onUpdateExpense={handleUpdateExpense}
+            onDeleteExpense={handleDeleteExpense}
+            onShowToast={showToast}
+          />
+        )}
+
+        {activeTab === 'inventory' && (
+          <InventoryView
+            products={products}
+            settings={settings}
+            onSaveProduct={handleSaveProduct}
+            onSaveCatalog={handleSaveCatalog}
+            onDeleteProduct={handleDeleteProduct}
+            onShowToast={showToast}
+          />
+        )}
+
+        {activeTab === 'history' && (
+          <HistoryView
+            orders={orders}
+            settings={settings}
+            onEditOrder={handleEditPendingOrder}
+            onReprintOrder={executePrintReceipt}
+            onCancelOrder={handleCancelOrder}
+            onDeleteOrderPermanently={handleDeleteOrderPermanently}
+            onShowToast={showToast}
+          />
+        )}
+
+        {activeTab === 'staff' && (
+          <StaffView
+            settings={settings}
+            onUpdateSettings={handleUpdateSettings}
+            onShowToast={showToast}
+          />
+        )}
+
+        {activeTab === 'settings' && (
+          <SettingsView
+            settings={settings}
+            onUpdateSettings={handleUpdateSettings}
+            onShowToast={showToast}
+          />
+        )}
+
+        {activeTab === 'printer' && (
+          <PrinterView
+            settings={settings}
+            onUpdateSettings={handleUpdateSettings}
+            onShowToast={showToast}
+            onTestPrint={() =>
+              executePrintReceipt({
+                id: 'TEST-PRINT',
+                date: new Date().toISOString().split('T')[0],
+                time: '12:00',
+                timestamp: Date.now(),
+                customer: 'Pelanggan Uji Coba',
+                items: [
+                  {
+                    id: 'test-1',
+                    name: 'Koneksi Printer Berhasil',
+                    category: 'Test',
+                    price: 15000,
+                    qty: 1,
+                    type: 'service',
+                    reqStaffRole: 'Kasir',
+                    available: true,
+                  },
+                ],
+                subtotal: 15000,
+                discount: 0,
+                discountType: 'Rp',
+                discountValue: 0,
+                total: 15000,
+                status: 'selesai',
+                payment: 'Cash',
+                shift: settings.activeShift,
+                cashierName: settings.activeShift === '1' ? settings.shift1Name : settings.shift2Name,
+                businessType: settings.businessType,
+              })
+            }
+            btStatusKasir={btStatusKasir}
+            btStatusDapur={btStatusDapur}
+            onConnectPrinterKasir={() => connectBluetoothPrinter('kasir')}
+            onDisconnectPrinterKasir={() => disconnectBluetoothPrinter('kasir')}
+            onConnectPrinterDapur={() => connectBluetoothPrinter('dapur')}
+            onDisconnectPrinterDapur={() => disconnectBluetoothPrinter('dapur')}
+          />
+        )}
+      </main>
+
+      {/* Tab PIN Authentication Modal (Replaces window.prompt) */}
+      {tabAuthModal && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 backdrop-blur-xs animate-in fade-in">
+          <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl border border-slate-200">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-10 h-10 rounded-xl bg-red-100 flex items-center justify-center text-blue-600 shrink-0">
+                <Lock className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-sm font-extrabold text-slate-900 leading-tight">
+                  {tabAuthModal.title}
+                </h3>
+                <p className="text-[11px] text-slate-500 font-medium">
+                  Masukkan PIN / Sandi untuk melanjutkan
+                </p>
+              </div>
+            </div>
+
+            <form onSubmit={handleVerifyTabPin} className="space-y-4">
+              <div>
+                <div className="relative">
+                  <input
+                    type={showTabPin ? 'text' : 'password'}
+                    autoFocus
+                    value={enteredTabPin}
+                    onChange={(e) => {
+                      setEnteredTabPin(e.target.value);
+                      setTabPinError(null);
+                    }}
+                    placeholder="Masukkan PIN..."
+                    className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-300 rounded-xl text-sm font-bold text-slate-900 tracking-wider focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowTabPin(!showTabPin)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                  >
+                    {showTabPin ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+                {tabPinError && (
+                  <p className="text-[11px] font-bold text-blue-600 mt-1.5 animate-shake">
+                    {tabPinError}
+                  </p>
+                )}
+              </div>
+
+              <div className="flex gap-2 justify-end">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTabAuthModal(null);
+                    setEnteredTabPin('');
+                    setTabPinError(null);
+                  }}
+                  className="px-4 py-2 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-100 transition-colors"
+                >
+                  Batal
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-black shadow-md shadow-blue-600/20 transition-all"
+                >
+                  Buka Akses
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// STAGE4B_SOURCE_MIGRATED
+// STAGE4C_SOURCE_MIGRATED

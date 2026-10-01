@@ -1,0 +1,86 @@
+import { BusinessCategoryPreset, BusinessType } from '../types';
+
+/**
+ * Business presets contain only UI metadata.
+ * Merchant-owned categories, staff, payment methods, and catalog items are
+ * intentionally empty until the merchant configures them.
+ */
+export const BUSINESS_PRESETS: Record<BusinessType, BusinessCategoryPreset> = {
+  barbershop: {
+    id: 'barbershop',
+    name: 'Barbershop & Pangkas Rambut',
+    tagline: 'Potong rambut, styling, perawatan jenggot & produk pomade',
+    icon: 'Scissors',
+    identifierLabel: 'No. Kursi / Nama Klien',
+    defaultStaffRoles: [],
+    defaultCategories: [],
+    defaultPaymentMethods: [],
+    defaultItems: [],
+  },
+  salon: {
+    id: 'salon',
+    name: 'Salon Kecantikan & Spa',
+    tagline: 'Perawatan rambut, facial, manicure, pedicure, & eyelash',
+    icon: 'Sparkles',
+    identifierLabel: 'No. Kursi / Nama Tamu',
+    defaultStaffRoles: [],
+    defaultCategories: [],
+    defaultPaymentMethods: [],
+    defaultItems: [],
+  },
+  fnb: {
+    id: 'fnb',
+    name: 'Food & Beverage (Resto/Cafe)',
+    tagline: 'Restoran, cafe, warmindo, kedai kopi, & warung makan',
+    icon: 'Utensils',
+    identifierLabel: 'No. Meja / Pemesan',
+    defaultStaffRoles: [],
+    defaultCategories: [],
+    defaultPaymentMethods: [],
+    defaultItems: [],
+  },
+  retail: {
+    id: 'retail',
+    name: 'Retail & Toko Kelontong / Minimarket',
+    tagline: 'Toko sembako, busana, minimarket, & toko retail',
+    icon: 'Store',
+    identifierLabel: 'Nama Pelanggan / ID Member',
+    defaultStaffRoles: [],
+    defaultCategories: [],
+    defaultPaymentMethods: [],
+    defaultItems: [],
+  },
+  laundry: {
+    id: 'laundry',
+    name: 'Laundry Kiloan & Satuan',
+    tagline: 'Cuci komplit, dry clean, setrika, bedcover, & express',
+    icon: 'Shirt',
+    identifierLabel: 'No. Nota / Nama Pelanggan',
+    defaultStaffRoles: [],
+    defaultCategories: [],
+    defaultPaymentMethods: [],
+    defaultItems: [],
+  },
+  workshop: {
+    id: 'workshop',
+    name: 'Bengkel & Servis Kendaraan',
+    tagline: 'Servis rutin, ganti oli, tune-up, tambal ban & sparepart',
+    icon: 'Wrench',
+    identifierLabel: 'No. Polisi / Nama Pemilik',
+    defaultStaffRoles: [],
+    defaultCategories: [],
+    defaultPaymentMethods: [],
+    defaultItems: [],
+  },
+  custom: {
+    id: 'custom',
+    name: 'Custom / Jenis Usaha Sendiri',
+    tagline: 'Gunakan YUPOS untuk kebutuhan usaha Anda sendiri',
+    icon: 'Briefcase',
+    identifierLabel: 'Nama Klien / No. Pesanan',
+    defaultStaffRoles: [],
+    defaultCategories: [],
+    defaultPaymentMethods: [],
+    defaultItems: [],
+  },
+};
